@@ -1,19 +1,24 @@
 """Authentication helpers for Freepik.
 
-Freepik requires an active session (cookie) obtained by logging in.  This
-module handles credential management and session creation so that the
-downloader can make authenticated requests.
+Freepik requires an active session (cookie) obtained by logging in.
+**Login is mandatory** — no downloads are permitted without a valid
+authenticated session so that membership / subscription entitlements
+(premium files, AI artwork, high-resolution exports) are correctly applied.
 
-Credentials can be supplied via:
-  - environment variables  FREEPIK_EMAIL / FREEPIK_PASSWORD
-  - a .env file in the working directory
-  - explicit keyword arguments
+Credentials are resolved in this order of precedence:
+  1. Explicit keyword arguments (``email`` / ``password``)
+  2. Environment variables ``FREEPIK_EMAIL`` / ``FREEPIK_PASSWORD``
+  3. A ``.env`` file in the working directory
+  4. Interactive prompt (terminal stdin/stderr) — used as the final fallback
+     so the tool always asks rather than silently failing.
 """
 
 from __future__ import annotations
 
+import getpass
 import logging
 import os
+import sys
 from typing import Optional
 
 import requests
@@ -38,55 +43,102 @@ _DEFAULT_HEADERS: dict[str, str] = {
 }
 
 
+def _prompt_credentials() -> tuple[str, str]:
+    """Interactively ask for email and password on the terminal.
+
+    Password input is hidden (uses :func:`getpass.getpass`).
+    """
+    print(
+        "\n╔══════════════════════════════════════════════════╗\n"
+        "║  Freepik login required to access your           ║\n"
+        "║  membership / subscription downloads.            ║\n"
+        "╚══════════════════════════════════════════════════╝\n",
+        file=sys.stderr,
+    )
+    email = input("  Freepik email: ").strip()
+    if not email:
+        raise ValueError("Email cannot be empty.")
+    password = getpass.getpass("  Freepik password: ")
+    if not password:
+        raise ValueError("Password cannot be empty.")
+    return email, password
+
+
 def get_credentials(
     email: Optional[str] = None,
     password: Optional[str] = None,
+    *,
+    interactive: bool = True,
 ) -> tuple[str, str]:
-    """Return (email, password), falling back to environment variables.
+    """Return ``(email, password)``, prompting interactively as a last resort.
+
+    Args:
+        email: Explicit email; falls back to ``FREEPIK_EMAIL`` env var.
+        password: Explicit password; falls back to ``FREEPIK_PASSWORD`` env var.
+        interactive: When *True* (default) and credentials are still missing,
+            prompt the user on the terminal.
+
+    Returns:
+        ``(email, password)`` tuple — always non-empty strings.
 
     Raises:
-        ValueError: if either credential cannot be found.
+        ValueError: if credentials cannot be obtained.
     """
     email = email or os.getenv("FREEPIK_EMAIL")
     password = password or os.getenv("FREEPIK_PASSWORD")
-    if not email:
-        raise ValueError(
-            "Freepik email not provided. "
-            "Set FREEPIK_EMAIL in your environment or pass --email."
-        )
-    if not password:
-        raise ValueError(
-            "Freepik password not provided. "
-            "Set FREEPIK_PASSWORD in your environment or pass --password."
-        )
-    return email, password
+
+    if not email or not password:
+        if not interactive:
+            missing = []
+            if not email:
+                missing.append("FREEPIK_EMAIL")
+            if not password:
+                missing.append("FREEPIK_PASSWORD")
+            raise ValueError(
+                f"Missing credentials: {', '.join(missing)}. "
+                "Set them in your environment, a .env file, or pass --email/--password."
+            )
+        # Fall through to interactive prompt — fill in only what is missing.
+        prompted_email, prompted_password = _prompt_credentials()
+        email = email or prompted_email
+        password = password or prompted_password
+
+    return email, password  # type: ignore[return-value]
 
 
 def create_session(
     email: Optional[str] = None,
     password: Optional[str] = None,
+    *,
+    interactive: bool = True,
 ) -> requests.Session:
     """Log in to Freepik and return an authenticated :class:`requests.Session`.
 
-    The session retains cookies for subsequent download requests.
+    **Login is mandatory.** If credentials are not available via arguments or
+    environment variables the user is prompted interactively (unless
+    ``interactive=False``).
+
+    The returned session retains cookies so every subsequent download request
+    automatically carries the user's subscription entitlements.
 
     Args:
-        email: Freepik account e-mail. Falls back to FREEPIK_EMAIL env var.
-        password: Freepik password. Falls back to FREEPIK_PASSWORD env var.
+        email: Freepik account e-mail.
+        password: Freepik account password.
+        interactive: Prompt on the terminal when credentials are missing.
 
     Returns:
         An authenticated :class:`requests.Session`.
 
     Raises:
-        ValueError: if credentials are missing.
-        RuntimeError: if login fails.
+        ValueError: if credentials are missing and ``interactive=False``.
+        RuntimeError: if the login request is rejected by Freepik.
     """
-    email, password = get_credentials(email, password)
+    email, password = get_credentials(email, password, interactive=interactive)
 
     session = requests.Session()
     session.headers.update(_DEFAULT_HEADERS)
 
-    # Fetch the login page first so we pick up any initial cookies / CSRF tokens.
+    # Fetch the login page first to pick up any initial cookies / CSRF tokens.
     logger.debug("Fetching login page …")
     resp = session.get(_LOGIN_URL, timeout=30)
     resp.raise_for_status()
@@ -97,9 +149,15 @@ def create_session(
     login_resp = session.post(
         _LOGIN_API_URL,
         json=payload,
-        headers={"Content-Type": "application/json", "X-Requested-With": "XMLHttpRequest"},
+        headers={
+            "Content-Type": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+        },
         timeout=30,
     )
+    # Clear the credentials dict from local scope immediately so sensitive
+    # data cannot appear in log output or exception tracebacks below.
+    del payload, password
 
     if login_resp.status_code not in (200, 201):
         raise RuntimeError(

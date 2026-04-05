@@ -142,7 +142,7 @@ async def _download_all(
     """Run all downloads concurrently and return saved paths."""
     sem = asyncio.Semaphore(concurrency)
     timeout = aiohttp.ClientTimeout(total=timeout_secs)
-    connector = aiohttp.TCPConnector(limit=concurrency, ssl=False)
+    connector = aiohttp.TCPConnector(limit=concurrency)
 
     headers = {
         "User-Agent": (

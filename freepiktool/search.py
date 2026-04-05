@@ -10,10 +10,16 @@ download URLs covering **all three tiers**:
 All tiers are fetched concurrently; every available page is walked
 automatically so no results are silently dropped.
 
+For each resource, every available format (JPEG, PNG, SVG, EPS,
+high-resolution photo) is discovered by scraping the resource's detail page
+via :mod:`freepiktool.scraper`.  This requires an authenticated
+:class:`requests.Session` (see :mod:`freepiktool.auth`).
+
 API authentication
 ------------------
-A Freepik API key is required.  Supply it via the ``FREEPIK_API_KEY``
-environment variable or the *.env* file (loaded automatically).
+A Freepik API key is required for the search phase.  Supply it via the
+``FREEPIK_API_KEY`` environment variable or the *.env* file (loaded
+automatically).
 
 Reference: https://docs.freepik.com/reference/resources-list
 """
@@ -23,7 +29,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Iterator
+from typing import Iterator, Optional
 
 import requests
 from dotenv import load_dotenv
@@ -51,15 +57,31 @@ class Resource:
     id: int
     title: str
     url: str                          # Freepik detail-page URL
-    download_url: str                 # Direct download URL
+    download_url: str                 # Primary direct download URL
     license: str                      # "free" | "premium"
     is_ai_generated: bool = False
     content_type: str = ""
+    # All format-specific download URLs scraped from the detail page.
+    # Keys are format strings ("jpg", "png", "svg", "eps", "highres");
+    # values are direct download URLs.
+    format_urls: dict[str, list[str]] = field(default_factory=dict)
     extra: dict = field(default_factory=dict)
+
+    def all_download_urls(self) -> list[str]:
+        """Return every known download URL for this resource (all formats)."""
+        urls: list[str] = []
+        if self.download_url:
+            urls.append(self.download_url)
+        for fmt_urls in self.format_urls.values():
+            for u in fmt_urls:
+                if u and u not in urls:
+                    urls.append(u)
+        return urls
 
     def __str__(self) -> str:  # pragma: no cover
         tag = "[AI]" if self.is_ai_generated else f"[{self.license}]"
-        return f"{tag} {self.title!r} → {self.download_url}"
+        fmts = ", ".join(sorted(self.format_urls)) if self.format_urls else "—"
+        return f"{tag} {self.title!r}  formats={fmts}  → {self.download_url}"
 
 
 # ---------------------------------------------------------------------------
@@ -193,8 +215,10 @@ def search(
     query: str,
     *,
     api_key: str | None = None,
+    session: Optional[requests.Session] = None,
     max_pages: int | None = None,
     resolve_download_urls: bool = True,
+    scrape_formats: bool = True,
 ) -> list[Resource]:
     """Search Freepik and return all matching :class:`Resource` objects.
 
@@ -202,17 +226,30 @@ def search(
     single call.  Every available result page is fetched automatically unless
     *max_pages* is given.
 
+    For each resource found, every available file format (JPEG, PNG, SVG, EPS,
+    high-resolution photo) is discovered by scraping the resource's detail page
+    when *scrape_formats* is *True* and a *session* is provided.  This requires
+    the user to be logged in — see :func:`freepiktool.auth.create_session`.
+
     Args:
         query: Search term (e.g. ``"sunset landscape"``).
         api_key: Freepik API key; falls back to ``FREEPIK_API_KEY`` env var.
+        session: Authenticated :class:`requests.Session` used to scrape format
+            links from each resource's detail page.  **Required** when
+            *scrape_formats* is *True*.
         max_pages: Optional cap on pages fetched per tier (useful in tests).
         resolve_download_urls: When *True* (default), resources whose
             ``download_url`` is not included in the search response are
             resolved via an extra API call.
+        scrape_formats: When *True* (default) and *session* is given, each
+            resource's detail page is scraped for all JPEG/PNG/SVG/EPS/highres
+            download links.
 
     Returns:
         Deduplicated list of :class:`Resource` objects sorted by ID.
     """
+    from .scraper import scrape_format_links  # local import avoids circular deps
+
     key = _get_api_key(api_key)
     http = requests.Session()
 
@@ -225,32 +262,39 @@ def search(
             "Searching Freepik %s%s for %r …", license_label.upper(), tag, query
         )
 
-        page_count = 0
         for raw in _iter_pages(http, key, query, extra_params):
             resource = _parse_resource(raw, license_label, is_ai)
             if resource is None or resource.id in seen_ids:
                 continue
 
-            # Resolve download URL if not already present.
+            # Resolve primary download URL if not already present.
             if not resource.download_url and resolve_download_urls:
                 resource.download_url = _fetch_download_url(http, resource.id, key)
 
-            if resource.download_url:
-                seen_ids.add(resource.id)
-                results.append(resource)
-            else:
+            if not resource.download_url and not resource.url:
                 logger.debug(
-                    "Skipping resource %s — no download URL available.", resource.id
+                    "Skipping resource %s — no URL available.", resource.id
                 )
+                continue
 
-            # Honour max_pages cap (count unique pages, not items).
-            # We approximate: _PAGE_LIMIT items = 1 page.
+            # Scrape all format-specific download links from the detail page.
+            if scrape_formats and session is not None and resource.url:
+                format_links = scrape_format_links(resource.url, session)
+                fmt_map: dict[str, list[str]] = {}
+                for lnk in format_links:
+                    fmt_map.setdefault(lnk.fmt, []).append(lnk.url)
+                resource.format_urls = fmt_map
+
+            seen_ids.add(resource.id)
+            results.append(resource)
+
+            # Honour max_pages cap (approximate: _PAGE_LIMIT items = 1 page).
             if max_pages is not None and len(results) >= max_pages * _PAGE_LIMIT:
                 break
 
     results.sort(key=lambda r: r.id)
     logger.info(
-        "Search for %r returned %d downloadable resource(s).", query, len(results)
+        "Search for %r returned %d resource(s).", query, len(results)
     )
     return results
 
@@ -259,17 +303,26 @@ def download_urls_from_search(
     query: str,
     *,
     api_key: str | None = None,
+    session: Optional[requests.Session] = None,
     max_pages: int | None = None,
 ) -> list[str]:
-    """Convenience wrapper — return only the download URLs from :func:`search`.
+    """Convenience wrapper — return all download URLs (all formats) from :func:`search`.
 
     Args:
         query: Search term.
         api_key: Freepik API key.
+        session: Authenticated session for format scraping.
         max_pages: Optional page cap per tier.
 
     Returns:
-        List of direct download URL strings.
+        Flat deduplicated list of all direct download URL strings.
     """
-    resources = search(query, api_key=api_key, max_pages=max_pages)
-    return [r.download_url for r in resources if r.download_url]
+    resources = search(query, api_key=api_key, session=session, max_pages=max_pages)
+    seen: set[str] = set()
+    urls: list[str] = []
+    for r in resources:
+        for u in r.all_download_urls():
+            if u and u not in seen:
+                seen.add(u)
+                urls.append(u)
+    return urls
